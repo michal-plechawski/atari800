@@ -55,15 +55,16 @@ static char const * const mode_cfg_strings[ARTIFACT_SIZE] = {
 	"PAL-SIMPLE",
 #endif /* NO_SIMPLE_PAL_BLENDING */
 #ifdef PAL_BLENDING
-	"PAL-BLEND"
+	"PAL-BLEND",
 #endif /* PAL_BLENDING */
+	"PAL-ALTIRRA-HI"
 };
 
 static void UpdateMode(ARTIFACT_t old_mode, int reinit)
 {
-#if (NTSC_FILTER && SUPPORTS_CHANGE_VIDEOMODE) || defined(PAL_BLENDING)
+#if SUPPORTS_CHANGE_VIDEOMODE
 	int need_reinit = FALSE;
-#endif /* (NTSC_FILTER && SUPPORTS_CHANGE_VIDEOMODE) || defined(PAL_BLENDING) */
+#endif /* SUPPORTS_CHANGE_VIDEOMODE */
 	if (ARTIFACT_mode == old_mode)
 		return;
 
@@ -74,12 +75,17 @@ static void UpdateMode(ARTIFACT_t old_mode, int reinit)
 	    old_mode == ARTIFACT_NTSC_FULL)
 		need_reinit = TRUE;
 #endif /* NTSC_FILTER && SUPPORTS_CHANGE_VIDEOMODE */
-#ifdef PAL_BLENDING
+#if defined(PAL_BLENDING) && SUPPORTS_CHANGE_VIDEOMODE
 	/* If PAL blending was enabled/disabled, video mode needs update. */
 	if (ARTIFACT_mode == ARTIFACT_PAL_BLEND ||
 	    old_mode == ARTIFACT_PAL_BLEND)
 		need_reinit = TRUE;
-#endif /* PAL_BLENDING */
+#endif /* defined(PAL_BLENDING) && SUPPORTS_CHANGE_VIDEOMODE */
+#if SUPPORTS_CHANGE_VIDEOMODE
+	if (ARTIFACT_mode == ARTIFACT_PAL_ALTIRRA_HI ||
+	    old_mode == ARTIFACT_PAL_ALTIRRA_HI)
+		need_reinit = TRUE;
+#endif /* SUPPORTS_CHANGE_VIDEOMODE */
 #ifndef NO_SIMPLE_PAL_BLENDING
 	ANTIC_pal_blending = ARTIFACT_mode == ARTIFACT_PAL_SIMPLE;
 #endif /* NO_SIMPLE_PAL_BLENDING */
@@ -93,7 +99,7 @@ static void UpdateMode(ARTIFACT_t old_mode, int reinit)
 		ANTIC_artif_new = ARTIFACT_mode == ARTIFACT_NTSC_NEW;
 	}
 	ANTIC_UpdateArtifacting();
-#if NTSC_FILTER && SUPPORTS_CHANGE_VIDEOMODE
+#if SUPPORTS_CHANGE_VIDEOMODE
 	if (need_reinit && reinit) {
 		if (!VIDEOMODE_Update()) {
 			ARTIFACT_t tmp = ARTIFACT_mode;
@@ -102,7 +108,7 @@ static void UpdateMode(ARTIFACT_t old_mode, int reinit)
 			UpdateMode(tmp, FALSE);
 		}
 	}
-#endif /* NTSC_FILTER && SUPPORTS_CHANGE_VIDEOMODE */
+#endif /* SUPPORTS_CHANGE_VIDEOMODE */
 }
 
 static void UpdateFromTVMode(int tv_mode)
@@ -208,6 +214,7 @@ int ARTIFACT_Initialise(int *argc, char *argv[])
 #ifdef PAL_BLENDING
 						"|pal-blend"
 #endif
+						"|pal-altirra-hi"
 				);
 				Log_print("\t                 Select video artifacts for PAL");
 			}

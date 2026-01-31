@@ -231,6 +231,12 @@ if !WANT_CURSES_BASIC
 # These objects are not compiled when --with-video=no or --enable-cursesbasic=no
 atari800_SOURCES += \
 	artifact.c artifact.h \
+	altirra_artifacting/artifacting.c altirra_artifacting/artifacting_c.h \
+	altirra_artifacting/artifacting_filters.c altirra_artifacting/artifacting_filters.h \
+	altirra_artifacting/artifacting_pal_scalar.c \
+	altirra_artifacting/atc_internal.h \
+	altirra_artifacting/gtiatables.c altirra_artifacting/gtiatables.h \
+	altirra_artifacting/palettegenerator.c altirra_artifacting/palettegenerator.h \
 	colours.c colours.h \
 	colours_ntsc.c colours_ntsc.h \
 	colours_pal.c colours_pal.h \
@@ -374,6 +380,7 @@ EXTRA_DIST = $(doc_DATA) atari800.man
 EXTRA_DIST += joycfg.c mkimg.c
 EXTRA_DIST += vtxsmpls.inc
 EXTRA_DIST += javanvm/UnixRuntime.patch javanvm/atari800.java
+EXTRA_DIST += sdl/crt-royale
 EXTRA_DIST += macosx
 EXTRA_DIST += wince
 EXTRA_DIST += amiga

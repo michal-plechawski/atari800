@@ -61,6 +61,7 @@ int SDL_VIDEO_height;
 int SDL_VIDEO_crt_barrel_distortion = 0;
 int SDL_VIDEO_crt_beam_shape = 10;
 int SDL_VIDEO_crt_phosphor_glow = 4;
+int SDL_VIDEO_crt_emulation = SDL_VIDEO_CRT_EMULATION_STANDARD;
 
 VIDEOMODE_MODE_t SDL_VIDEO_current_display_mode = VIDEOMODE_MODE_NORMAL;
 
@@ -375,6 +376,18 @@ int SDL_VIDEO_ReadConfig(char *option, char *parameters)
 			SDL_VIDEO_crt_phosphor_glow = value;
 		}
 	}
+	else if (strcmp(option, "CRT_EMULATION") == 0) {
+		if (Util_stricmp(parameters, "STANDARD") == 0)
+			SDL_VIDEO_crt_emulation = SDL_VIDEO_CRT_EMULATION_STANDARD;
+		else if (Util_stricmp(parameters, "CRT-ROYALE") == 0 || Util_stricmp(parameters, "ROYALE") == 0)
+			SDL_VIDEO_crt_emulation = SDL_VIDEO_CRT_EMULATION_ROYALE;
+		else {
+			int value = Util_sscandec(parameters);
+			if (value < 0 || value >= SDL_VIDEO_CRT_EMULATION_SIZE)
+				return FALSE;
+			SDL_VIDEO_crt_emulation = value;
+		}
+	}
 #endif
 	else if (strcmp(option, "VIDEO_ACCEL") == 0)
 		return (currently_opengl = SDL_VIDEO_opengl = Util_sscanbool(parameters)) != -1;
@@ -400,6 +413,8 @@ void SDL_VIDEO_WriteConfig(FILE *fp)
 	fprintf(fp, "CRT_BARREL_DISTORTION=%d\n", SDL_VIDEO_crt_barrel_distortion);
 	fprintf(fp, "CRT_BEAM_SHAPE=%d\n", SDL_VIDEO_crt_beam_shape);
 	fprintf(fp, "CRT_PHOSPHOR_GLOW=%d\n", SDL_VIDEO_crt_phosphor_glow);
+	fprintf(fp, "CRT_EMULATION=%s\n",
+	        SDL_VIDEO_crt_emulation == SDL_VIDEO_CRT_EMULATION_ROYALE ? "CRT-ROYALE" : "STANDARD");
 #endif
 #endif
 	SDL_VIDEO_SW_WriteConfig(fp);
@@ -1065,6 +1080,16 @@ void SDL_VIDEO_CrtPhosphorGlow(int value) {
 	else if (value > 20)
 		value = 20;
 	SDL_VIDEO_crt_phosphor_glow = value;
+#if HAVE_OPENGL && SDL2
+	SDL_VIDEO_GL_DisplayScreen();
+#endif /* HAVE_OPENGL && SDL2 */
+}
+
+void SDL_VIDEO_SetCrtEmulation(int value)
+{
+	if (value < 0 || value >= SDL_VIDEO_CRT_EMULATION_SIZE)
+		value = SDL_VIDEO_CRT_EMULATION_STANDARD;
+	SDL_VIDEO_crt_emulation = value;
 #if HAVE_OPENGL && SDL2
 	SDL_VIDEO_GL_DisplayScreen();
 #endif /* HAVE_OPENGL && SDL2 */

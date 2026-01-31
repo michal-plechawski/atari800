@@ -2533,13 +2533,19 @@ static void CrtGlowSliderLabel(char *label, int value, void *user_data) {
 #if SDL2
 static void show_hide_crt_options(UI_tMenuItem menu_array[]) {
 	// hide/show options that require hardware renderer (and shaders)
-	for (int index = 19; index <= 21; ++index) {
 #if HAVE_OPENGL
-		FindMenuItem(menu_array, index)->flags = !SDL_VIDEO_opengl ? UI_ITEM_HIDDEN : UI_ITEM_SUBMENU;
+	const int show = SDL_VIDEO_opengl;
 #else
-		FindMenuItem(menu_array, index)->flags = UI_ITEM_HIDDEN;
+	const int show = 0;
 #endif
+	for (int index = 19; index <= 22; ++index)
+		FindMenuItem(menu_array, index)->flags = show ? UI_ITEM_SUBMENU : UI_ITEM_HIDDEN;
+#if HAVE_OPENGL
+	if (show && SDL_VIDEO_crt_emulation == SDL_VIDEO_CRT_EMULATION_ROYALE) {
+		for (int index = 20; index <= 22; ++index)
+			FindMenuItem(menu_array, index)->flags = UI_ITEM_HIDDEN;
 	}
+#endif
 }
 #endif
 
@@ -2612,8 +2618,16 @@ static void VideoModeSettings(void)
 		UI_MENU_ACTION(3, "32-bit ARGB"),
 		UI_MENU_END
 	};
+#if SDL2
+	static const UI_tMenuItem crt_emulation_menu_array[] = {
+		UI_MENU_ACTION(SDL_VIDEO_CRT_EMULATION_STANDARD, "Standard"),
+		UI_MENU_ACTION(SDL_VIDEO_CRT_EMULATION_ROYALE, "CRT-Royale"),
+		UI_MENU_END
+	};
+#endif /* SDL2 */
 #endif /* HAVE_OPENGL */
 	static char scanlines_string[4];
+	static char crt_emulation_string[16];
 	static char barrel_string[4];
 	static char beam_string[4];
 	static char glow_string[4];
@@ -2651,9 +2665,10 @@ static void VideoModeSettings(void)
 		UI_MENU_SUBMENU_SUFFIX(17, "Scanlines visibility:", scanlines_string),
 		UI_MENU_CHECK(18, " Interpolate scanlines:"),
 #if HAVE_OPENGL && SDL2
-		UI_MENU_SUBMENU_SUFFIX(19, "CRT barrel distortion:", barrel_string),
-		UI_MENU_SUBMENU_SUFFIX(20, "CRT beam shape:", beam_string),
-		UI_MENU_SUBMENU_SUFFIX(21, "CRT phosphor glow:", glow_string),
+		UI_MENU_SUBMENU_SUFFIX(19, "CRT emulation:", crt_emulation_string),
+		UI_MENU_SUBMENU_SUFFIX(20, "CRT barrel distortion:", barrel_string),
+		UI_MENU_SUBMENU_SUFFIX(21, "CRT beam shape:", beam_string),
+		UI_MENU_SUBMENU_SUFFIX(22, "CRT phosphor glow:", glow_string),
 #endif
 #endif /* GUI_SDL */
 		UI_MENU_END
@@ -2688,6 +2703,9 @@ static void VideoModeSettings(void)
 		}
 		snprintf(scanlines_string, sizeof(scanlines_string), "%d", SDL_VIDEO_scanlines_percentage);
 		SetItemChecked(menu_array, 18, SDL_VIDEO_interpolate_scanlines);
+#if HAVE_OPENGL && SDL2
+		FindMenuItem(menu_array, 19)->suffix = crt_emulation_menu_array[SDL_VIDEO_crt_emulation].item;
+#endif
 		snprintf(barrel_string, sizeof(barrel_string), "%d", SDL_VIDEO_crt_barrel_distortion);
 		snprintf(beam_string, sizeof(beam_string), "%d", SDL_VIDEO_crt_beam_shape);
 		snprintf(glow_string, sizeof(glow_string), "%d", SDL_VIDEO_crt_phosphor_glow);
@@ -2931,6 +2949,12 @@ static void VideoModeSettings(void)
 			break;
 #if HAVE_OPENGL && SDL2
 		case 19:
+			option2 = UI_driver->fSelect(NULL, UI_SELECT_POPUP, SDL_VIDEO_crt_emulation,
+			                             crt_emulation_menu_array, NULL);
+			if (option2 >= 0)
+				SDL_VIDEO_SetCrtEmulation(option2);
+			break;
+		case 20:
 			{
 				int value = UI_driver->fSelectSlider("Adjust CRT barrel",
 				                                     SDL_VIDEO_crt_barrel_distortion,
@@ -2939,7 +2963,7 @@ static void VideoModeSettings(void)
 					SDL_VIDEO_CrtBarrelPercentage(value);
 			}
 			break;
-		case 20:
+		case 21:
 			{
 				int value = UI_driver->fSelectSlider("Adjust CRT beam shape",
 				                                     SDL_VIDEO_crt_beam_shape,
@@ -2948,7 +2972,7 @@ static void VideoModeSettings(void)
 					SDL_VIDEO_CrtBeamShape(value);
 			}
 			break;
-		case 21:
+		case 22:
 			{
 				int value = UI_driver->fSelectSlider("Adjust CRT glow",
 				                                     SDL_VIDEO_crt_phosphor_glow,
@@ -3176,6 +3200,7 @@ static void DisplaySettings(void)
 #if PAL_BLENDING
 		UI_MENU_ACTION(ARTIFACT_PAL_BLEND, "accurate PAL blending"),
 #endif /* PAL_BLENDING */
+		UI_MENU_ACTION(ARTIFACT_PAL_ALTIRRA_HI, "Altirra PAL hi"),
 		UI_MENU_END
 	};
 	static const UI_tMenuItem artif_mode_menu_array[] = {
@@ -3337,6 +3362,8 @@ static void DisplaySettings(void)
 			artif_menu_array[ARTIFACT_PAL_BLEND].flags =
 				Atari800_tv_mode == Atari800_TV_PAL ? UI_ITEM_ACTION : UI_ITEM_HIDDEN;
 #endif /* PAL_BLENDING */
+			artif_menu_array[ARTIFACT_PAL_ALTIRRA_HI].flags =
+				Atari800_tv_mode == Atari800_TV_PAL ? UI_ITEM_ACTION : UI_ITEM_HIDDEN;
 			option2 = UI_driver->fSelect(NULL, UI_SELECT_POPUP, ARTIFACT_mode, artif_menu_array, NULL);
 			if (option2 >= 0)
 				ARTIFACT_Set((ARTIFACT_t)option2);

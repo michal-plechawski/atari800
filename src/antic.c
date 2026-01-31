@@ -72,6 +72,9 @@ static int dmactl_bug_chdata;
 #ifndef NO_SIMPLE_PAL_BLENDING
 int ANTIC_pal_blending = 0;
 #endif /* NO_SIMPLE_PAL_BLENDING */
+#if !defined(BASIC) && !defined(CURSES_BASIC)
+UBYTE ANTIC_scanline_hires[Screen_HEIGHT];
+#endif
 
 /* Video memory access is hidden behind these macros. It allows to track dirty video memory
    to improve video system performance */
@@ -2874,6 +2877,9 @@ void ANTIC_Frame(int draw_display)
 	} while (ANTIC_ypos < 8);
 
 	scrn_ptr = (UWORD *) Screen_atari;
+#if !defined(BASIC) && !defined(CURSES_BASIC)
+	memset(ANTIC_scanline_hires, 0, sizeof(ANTIC_scanline_hires));
+#endif
 #ifdef NEW_CYCLE_EXACT
 	ANTIC_cur_screen_pos = ANTIC_NOT_DRAWING;
 #endif
@@ -2969,6 +2975,14 @@ void ANTIC_Frame(int draw_display)
 				break;
 			}
 		}
+#if !defined(BASIC) && !defined(CURSES_BASIC)
+		{
+			int hires = 0;
+			if (anticmode >= 2 && (ANTIC_DMACTL & 3) != 0)
+				hires = (md == NORMAL0 || md == SCROLL0);
+			ANTIC_scanline_hires[ANTIC_ypos - 8] = (UBYTE)hires;
+		}
+#endif
 #ifdef NEW_CYCLE_EXACT
 		cpu2antic_index = 0;
 		if (anticmode < 2 || (ANTIC_DMACTL & 3) == 0 ||

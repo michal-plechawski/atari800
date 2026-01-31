@@ -740,6 +740,9 @@ inaccurate.
 .B pal-blend
 Accurate emulation of PAL chroma blending, without composite artifacts.
 Available only in 16- and 32-bit video modes.
+.TP
+.B pal-altirra-hi
+Altirra PAL high artifacting. Available only in 16- and 32-bit video modes.
 .PD
 .RE
 .TP

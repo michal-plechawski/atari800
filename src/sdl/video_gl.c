@@ -27,13 +27,16 @@
 #include <stdlib.h>
 
 #include "af80.h"
+#include "antic.h"
 #include "bit3.h"
 #include "artifact.h"
+#include "altirra_artifacting/artifacting_c.h"
 #include "atari.h"
 #include "cfg.h"
 #include "colours.h"
 #include "config.h"
 #include "filter_ntsc.h"
+#include "gtia.h"
 #include "log.h"
 #include "pbi_proto80.h"
 #ifdef PAL_BLENDING
@@ -49,6 +52,10 @@
 #include "sdl/palette.h"
 #include "sdl/video.h"
 #include "sdl/video_gl.h"
+#if SDL2
+#include "sdl/crt-royale/crt_royale_masks.h"
+#include "sdl/crt-royale/crt_royale_masks.c"
+#endif
 
 #ifndef M_PI
 # define M_PI 3.141592653589793
@@ -57,6 +64,15 @@
 static int currently_rotated = FALSE;
 /* If TRUE, then 32 bit, else 16 bit screen. */
 static int bpp_32 = FALSE;
+
+static ATC_ArtifactingEngine *pal_hi_engine = NULL;
+static Uint8 *pal_hi_input = NULL;
+static Uint32 *pal_hi_output = NULL;
+static Uint32 pal_hi_map_r[256];
+static Uint32 pal_hi_map_g[256];
+static Uint32 pal_hi_map_b[256];
+static int pal_hi_pixel_format = -1;
+static Uint8 pal_hi_scanline_hires[ATC_ARTIFACTING_M];
 
 int SDL_VIDEO_GL_filtering = 0;
 int SDL_VIDEO_GL_pixel_format = SDL_VIDEO_GL_PIXEL_FORMAT_BGR16;
@@ -139,10 +155,21 @@ static struct
 	GLint  (APIENTRY* GetUniformLocation)(GLuint program, const GLchar* name);
 	GLint  (APIENTRY* GetAttribLocation)(GLuint program, const GLchar* name);
 	void   (APIENTRY* DrawElements)(GLenum mode, GLsizei count, GLenum type, const GLvoid* indices);
+	void   (APIENTRY* BindAttribLocation)(GLuint program, GLuint index, const GLchar* name);
+	void   (APIENTRY* DeleteProgram)(GLuint program);
+	void   (APIENTRY* GenFramebuffers)(GLsizei n, GLuint* framebuffers);
+	void   (APIENTRY* BindFramebuffer)(GLenum target, GLuint framebuffer);
+	void   (APIENTRY* FramebufferTexture2D)(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
+	GLenum (APIENTRY* CheckFramebufferStatus)(GLenum target);
+	void   (APIENTRY* DeleteFramebuffers)(GLsizei n, const GLuint* framebuffers);
+	void   (APIENTRY* DeleteVertexArrays)(GLsizei n, const GLuint* arrays);
+	void   (APIENTRY* DeleteBuffers)(GLsizei n, const GLuint* buffers);
+	void   (APIENTRY* GenerateMipmap)(GLenum target);
 #endif
 } gl;
 
 static void DisplayNormal(GLvoid *dest);
+static void DisplayAltirraPalHi(GLvoid *dest);
 #if NTSC_FILTER
 static void DisplayNTSCEmu(GLvoid *dest);
 #endif
@@ -161,6 +188,10 @@ static void DisplayBIT3(GLvoid *dest);
 #ifdef PAL_BLENDING
 static void DisplayPalBlending(GLvoid *dest);
 #endif /* PAL_BLENDING */
+#if SDL2
+static void CrtRoyale_Destroy(void);
+static int CrtRoyale_Display(void);
+#endif
 
 static void (* blit_funcs[VIDEOMODE_MODE_SIZE])(GLvoid *) = {
 	&DisplayNormal
@@ -325,6 +356,9 @@ static void CleanGlContext(void)
 {
 	if (!gl.DeleteLists) return;
 
+#if SDL2
+	CrtRoyale_Destroy();
+#endif
 		if (SDL_VIDEO_GL_pbo)
 			gl.DeleteBuffersARB(1, &screen_pbo);
 		gl.DeleteLists(screen_dlist, 1);
@@ -757,6 +791,46 @@ static GLint sh_resolution;
 static GLint sh_pixelSpread;
 static GLint sh_glow;
 
+#define CRT_ROYALE_PASS_COUNT 9
+#define CRT_ROYALE_MAX_PASS_PREV 6
+#define CRT_ROYALE_MASK_TEXTURES 6
+
+typedef struct {
+	GLint mvp;
+	GLint frame_count;
+	GLint frame_direction;
+	GLint output_size;
+	GLint input_size;
+	GLint texture_size;
+	GLint texture;
+	GLint pass_prev_tex[CRT_ROYALE_MAX_PASS_PREV];
+	GLint pass_prev_input_size[CRT_ROYALE_MAX_PASS_PREV];
+	GLint pass_prev_texture_size[CRT_ROYALE_MAX_PASS_PREV];
+	GLint mask_tex[CRT_ROYALE_MASK_TEXTURES];
+} CrtRoyaleUniforms;
+
+static int crt_royale_ready = FALSE;
+static int crt_royale_failed = FALSE;
+static int crt_royale_frame_count = 0;
+static int crt_royale_input_w = 0;
+static int crt_royale_input_h = 0;
+static int crt_royale_viewport_w = 0;
+static int crt_royale_viewport_h = 0;
+static int crt_royale_glsl_version = 130;
+static int crt_royale_pass_w[CRT_ROYALE_PASS_COUNT];
+static int crt_royale_pass_h[CRT_ROYALE_PASS_COUNT];
+static int crt_royale_use_mipmaps = FALSE;
+static GLuint crt_royale_programs[CRT_ROYALE_PASS_COUNT];
+static CrtRoyaleUniforms crt_royale_uniforms[CRT_ROYALE_PASS_COUNT];
+static GLuint crt_royale_fbos[CRT_ROYALE_PASS_COUNT];
+static GLuint crt_royale_textures[CRT_ROYALE_PASS_COUNT];
+static GLuint crt_royale_mask_textures[CRT_ROYALE_MASK_TEXTURES];
+static GLuint crt_royale_vao = 0;
+static GLuint crt_royale_vbo_pos = 0;
+static GLuint crt_royale_vbo_uv = 0;
+static GLuint crt_royale_vbo_color = 0;
+static GLuint crt_royale_ebo = 0;
+
 #define	TEX_WIDTH	1024
 #define	TEX_HEIGHT	512
 #define	WIDTH		320
@@ -846,6 +920,246 @@ static void SetOrtho(float m[4][4], float scale_x, float scale_y, float angle) {
 	m[1][1] = -scale_y * c;
 }
 
+static const char * const crt_royale_shader_paths[CRT_ROYALE_PASS_COUNT] = {
+	"sdl/crt-royale/src/crt-royale-first-pass-linearize-crt-gamma-bob-fields.glsl",
+	"sdl/crt-royale/src/crt-royale-scanlines-vertical-interlacing.glsl",
+	"sdl/crt-royale/src/crt-royale-bloom-approx-fake-bloom.glsl",
+	"sdl/crt-royale/shaders/blurs/royale/blur9fast-vertical.glsl",
+	"sdl/crt-royale/shaders/blurs/royale/blur9fast-horizontal.glsl",
+	"sdl/crt-royale/src/crt-royale-mask-resize-vertical.glsl",
+	"sdl/crt-royale/src/crt-royale-mask-resize-horizontal.glsl",
+	"sdl/crt-royale/src/crt-royale-scanlines-horizontal-apply-mask-fake-bloom.glsl",
+	"sdl/crt-royale/src/crt-royale-geometry-aa-last-pass.glsl"
+};
+
+static const char * const crt_royale_mask_uniforms[CRT_ROYALE_MASK_TEXTURES] = {
+	"mask_grille_texture_small",
+	"mask_grille_texture_large",
+	"mask_slot_texture_small",
+	"mask_slot_texture_large",
+	"mask_shadow_texture_small",
+	"mask_shadow_texture_large"
+};
+
+enum {
+	CRT_ROYALE_ATTR_POS = 0,
+	CRT_ROYALE_ATTR_TEX = 1,
+	CRT_ROYALE_ATTR_COLOR = 2
+};
+
+enum {
+	CRT_ROYALE_TEXUNIT_TEXTURE = 0,
+	CRT_ROYALE_TEXUNIT_PASS_PREV_BASE = 1,
+	CRT_ROYALE_TEXUNIT_MASK_BASE = 7
+};
+
+static char *CrtRoyale_ReadShaderFile(const char *path)
+{
+	const char *prefixes[] = { "", "src/", "../src/", "../../src/" };
+	char full[FILENAME_MAX];
+	FILE *fp = NULL;
+	size_t i;
+
+	for (i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+		snprintf(full, sizeof(full), "%s%s", prefixes[i], path);
+		fp = fopen(full, "rb");
+		if (fp != NULL)
+			break;
+	}
+	if (fp == NULL)
+		return NULL;
+
+	fseek(fp, 0L, SEEK_END);
+	long size = ftell(fp);
+	rewind(fp);
+
+	char *buffer = (char *)Util_malloc((size_t)size + 1);
+	if (buffer == NULL) {
+		fclose(fp);
+		return NULL;
+	}
+
+	if (fread(buffer, (size_t)size, 1, fp) != 1) {
+		fclose(fp);
+		free(buffer);
+		return NULL;
+	}
+	buffer[size] = 0;
+	fclose(fp);
+
+	return buffer;
+}
+
+static int CrtRoyale_DetectGlslVersion(void)
+{
+	const char *ver = (const char *)gl.GetString(GL_SHADING_LANGUAGE_VERSION);
+	int major = 0;
+	int minor = 0;
+	int combined;
+
+	if (!ver)
+		return 120;
+	if (sscanf(ver, "%d.%d", &major, &minor) < 1)
+		return 120;
+
+	combined = major * 100 + minor;
+	if (combined >= 150)
+		return 150;
+	if (combined >= 130)
+		return 130;
+	if (combined >= 120)
+		return 120;
+	return 110;
+}
+
+static char *CrtRoyale_PrependDefine(const char *source, const char *define_name)
+{
+	const char *newline = strchr(source, '\n');
+	size_t define_len;
+	char define_line[64];
+	char version_line[32];
+	size_t head_len;
+	size_t tail_len;
+	char *out;
+
+	if (newline == NULL)
+		return NULL;
+
+	snprintf(version_line, sizeof(version_line), "#version %d\n", crt_royale_glsl_version);
+	snprintf(define_line, sizeof(define_line), "#define %s\n", define_name);
+	define_len = strlen(define_line);
+	head_len = strlen(version_line);
+	tail_len = strlen(newline + 1);
+
+	out = (char *)Util_malloc(head_len + define_len + tail_len + 1);
+	if (out == NULL)
+		return NULL;
+
+	memcpy(out, version_line, head_len);
+	memcpy(out + head_len, define_line, define_len);
+	memcpy(out + head_len + define_len, newline + 1, tail_len);
+	out[head_len + define_len + tail_len] = 0;
+	return out;
+}
+
+static GLuint CrtRoyale_CompileShader(GLenum type, const char *source, const char *label)
+{
+	GLint success = 0;
+	GLuint shader = gl.CreateShader(type);
+
+	gl.ShaderSource(shader, 1, (GLchar * const *)&source, NULL);
+	gl.CompileShader(shader);
+	gl.GetShaderiv(shader, GL_COMPILE_STATUS, &success);
+	if (!success) {
+		char buf[1024];
+		gl.GetShaderInfoLog(shader, sizeof(buf), NULL, buf);
+		Log_print("Cannot compile CRT-Royale shader (%s): %s", label, buf);
+		gl.DeleteShader(shader);
+		return 0;
+	}
+	return shader;
+}
+
+static void CrtRoyale_InitUniforms(GLuint program, CrtRoyaleUniforms *uniforms)
+{
+	int i;
+
+	memset(uniforms, 0xff, sizeof(*uniforms));
+	uniforms->mvp = gl.GetUniformLocation(program, "MVPMatrix");
+	uniforms->frame_count = gl.GetUniformLocation(program, "FrameCount");
+	uniforms->frame_direction = gl.GetUniformLocation(program, "FrameDirection");
+	uniforms->output_size = gl.GetUniformLocation(program, "OutputSize");
+	uniforms->input_size = gl.GetUniformLocation(program, "InputSize");
+	uniforms->texture_size = gl.GetUniformLocation(program, "TextureSize");
+	uniforms->texture = gl.GetUniformLocation(program, "Texture");
+
+	for (i = 0; i < CRT_ROYALE_MAX_PASS_PREV; i++) {
+		char name[64];
+		snprintf(name, sizeof(name), "PassPrev%dTexture", i + 1);
+		uniforms->pass_prev_tex[i] = gl.GetUniformLocation(program, name);
+		snprintf(name, sizeof(name), "PassPrev%dInputSize", i + 1);
+		uniforms->pass_prev_input_size[i] = gl.GetUniformLocation(program, name);
+		snprintf(name, sizeof(name), "PassPrev%dTextureSize", i + 1);
+		uniforms->pass_prev_texture_size[i] = gl.GetUniformLocation(program, name);
+	}
+	for (i = 0; i < CRT_ROYALE_MASK_TEXTURES; i++)
+		uniforms->mask_tex[i] = gl.GetUniformLocation(program, crt_royale_mask_uniforms[i]);
+
+	gl.UseProgram(program);
+	if (uniforms->texture >= 0)
+		gl.Uniform1i(uniforms->texture, CRT_ROYALE_TEXUNIT_TEXTURE);
+	for (i = 0; i < CRT_ROYALE_MAX_PASS_PREV; i++) {
+		if (uniforms->pass_prev_tex[i] >= 0)
+			gl.Uniform1i(uniforms->pass_prev_tex[i], CRT_ROYALE_TEXUNIT_PASS_PREV_BASE + i);
+	}
+	for (i = 0; i < CRT_ROYALE_MASK_TEXTURES; i++) {
+		if (uniforms->mask_tex[i] >= 0)
+			gl.Uniform1i(uniforms->mask_tex[i], CRT_ROYALE_TEXUNIT_MASK_BASE + i);
+	}
+	gl.UseProgram(0);
+}
+
+static GLuint CrtRoyale_CreateProgram(const char *path, CrtRoyaleUniforms *uniforms)
+{
+	GLuint vertex = 0;
+	GLuint fragment = 0;
+	GLuint program = 0;
+	GLint success = 0;
+	char *source = CrtRoyale_ReadShaderFile(path);
+	if (source == NULL) {
+		Log_print("Missing CRT-Royale shader file '%s'", path);
+		return 0;
+	}
+	char *vertex_source = CrtRoyale_PrependDefine(source, "VERTEX");
+	char *fragment_source = CrtRoyale_PrependDefine(source, "FRAGMENT");
+
+	free(source);
+	if (vertex_source == NULL || fragment_source == NULL) {
+		free(vertex_source);
+		free(fragment_source);
+		return 0;
+	}
+
+	vertex = CrtRoyale_CompileShader(GL_VERTEX_SHADER, vertex_source, path);
+	fragment = CrtRoyale_CompileShader(GL_FRAGMENT_SHADER, fragment_source, path);
+	free(vertex_source);
+	free(fragment_source);
+
+	if (vertex == 0 || fragment == 0) {
+		if (vertex != 0)
+			gl.DeleteShader(vertex);
+		if (fragment != 0)
+			gl.DeleteShader(fragment);
+		return 0;
+	}
+
+	program = gl.CreateProgram();
+	gl.AttachShader(program, vertex);
+	gl.AttachShader(program, fragment);
+	if (gl.BindAttribLocation) {
+		gl.BindAttribLocation(program, CRT_ROYALE_ATTR_POS, "VertexCoord");
+		gl.BindAttribLocation(program, CRT_ROYALE_ATTR_TEX, "TexCoord");
+		gl.BindAttribLocation(program, CRT_ROYALE_ATTR_COLOR, "COLOR");
+	}
+	gl.LinkProgram(program);
+	gl.GetProgramiv(program, GL_LINK_STATUS, &success);
+	if (!success) {
+		char buf[1024];
+		gl.GetProgramInfoLog(program, sizeof(buf), NULL, buf);
+		Log_print("Cannot link CRT-Royale shader program (%s): %s", path, buf);
+		gl.DeleteShader(vertex);
+		gl.DeleteShader(fragment);
+		if (gl.DeleteProgram)
+			gl.DeleteProgram(program);
+		return 0;
+	}
+
+	gl.DeleteShader(vertex);
+	gl.DeleteShader(fragment);
+	CrtRoyale_InitUniforms(program, uniforms);
+	return program;
+}
+
 #ifdef DEBUG_SHADERS
 static char* read_text_file(const char* path) {
 	FILE* fp = fopen(path , "rb");
@@ -874,6 +1188,450 @@ static char* read_text_file(const char* path) {
 	return buffer;
 }
 #endif
+
+static int CrtRoyale_LoadFunctions(void)
+{
+	if (!gl.BindAttribLocation)
+		gl.BindAttribLocation = (void(APIENTRY*)(GLuint, GLuint, const GLchar*))GetGlFunc("glBindAttribLocation");
+	if (!gl.GenFramebuffers)
+		gl.GenFramebuffers = (void(APIENTRY*)(GLsizei, GLuint*))GetGlFunc("glGenFramebuffers");
+	if (!gl.BindFramebuffer)
+		gl.BindFramebuffer = (void(APIENTRY*)(GLenum, GLuint))GetGlFunc("glBindFramebuffer");
+	if (!gl.FramebufferTexture2D)
+		gl.FramebufferTexture2D = (void(APIENTRY*)(GLenum, GLenum, GLenum, GLuint, GLint))GetGlFunc("glFramebufferTexture2D");
+	if (!gl.CheckFramebufferStatus)
+		gl.CheckFramebufferStatus = (GLenum(APIENTRY*)(GLenum))GetGlFunc("glCheckFramebufferStatus");
+	if (!gl.DeleteFramebuffers)
+		gl.DeleteFramebuffers = (void(APIENTRY*)(GLsizei, const GLuint*))GetGlFunc("glDeleteFramebuffers");
+	if (!gl.DeleteProgram)
+		gl.DeleteProgram = (void(APIENTRY*)(GLuint))GetGlFunc("glDeleteProgram");
+	if (!gl.DeleteVertexArrays)
+		gl.DeleteVertexArrays = (void(APIENTRY*)(GLsizei, const GLuint*))GetGlFunc("glDeleteVertexArrays");
+	if (!gl.DeleteBuffers)
+		gl.DeleteBuffers = (void(APIENTRY*)(GLsizei, const GLuint*))GetGlFunc("glDeleteBuffers");
+	if (!gl.GenerateMipmap)
+		gl.GenerateMipmap = (void(APIENTRY*)(GLenum))GetGlFunc("glGenerateMipmap");
+
+	if (!gl.BindAttribLocation || !gl.GenFramebuffers || !gl.BindFramebuffer ||
+	    !gl.FramebufferTexture2D || !gl.CheckFramebufferStatus)
+		return FALSE;
+
+	return TRUE;
+}
+
+static void CrtRoyale_Destroy(void)
+{
+	int i;
+
+	if (gl.DeleteProgram) {
+		for (i = 0; i < CRT_ROYALE_PASS_COUNT; i++) {
+			if (crt_royale_programs[i]) {
+				gl.DeleteProgram(crt_royale_programs[i]);
+				crt_royale_programs[i] = 0;
+			}
+		}
+	}
+	if (gl.DeleteTextures) {
+		gl.DeleteTextures(CRT_ROYALE_MASK_TEXTURES, crt_royale_mask_textures);
+		gl.DeleteTextures(CRT_ROYALE_PASS_COUNT - 1, crt_royale_textures);
+	}
+	if (gl.DeleteFramebuffers)
+		gl.DeleteFramebuffers(CRT_ROYALE_PASS_COUNT - 1, crt_royale_fbos);
+	if (gl.DeleteVertexArrays && crt_royale_vao)
+		gl.DeleteVertexArrays(1, &crt_royale_vao);
+	if (gl.DeleteBuffers) {
+		GLuint buffers_to_delete[] = {
+			crt_royale_vbo_pos, crt_royale_vbo_uv, crt_royale_vbo_color, crt_royale_ebo
+		};
+		gl.DeleteBuffers((GLsizei)(sizeof(buffers_to_delete) / sizeof(buffers_to_delete[0])), buffers_to_delete);
+	}
+
+	memset(crt_royale_fbos, 0, sizeof(crt_royale_fbos));
+	memset(crt_royale_textures, 0, sizeof(crt_royale_textures));
+	memset(crt_royale_mask_textures, 0, sizeof(crt_royale_mask_textures));
+	crt_royale_vao = 0;
+	crt_royale_vbo_pos = 0;
+	crt_royale_vbo_uv = 0;
+	crt_royale_vbo_color = 0;
+	crt_royale_ebo = 0;
+	crt_royale_input_w = 0;
+	crt_royale_input_h = 0;
+	crt_royale_viewport_w = 0;
+	crt_royale_viewport_h = 0;
+	crt_royale_frame_count = 0;
+	crt_royale_ready = FALSE;
+	crt_royale_failed = FALSE;
+}
+
+static void CrtRoyale_SetUVs(float max_u, float max_v)
+{
+	const GLfloat uvs[] = {
+		0.0f, 0.0f, 0.0f, 0.0f,
+		max_u, 0.0f, 0.0f, 0.0f,
+		max_u, max_v, 0.0f, 0.0f,
+		0.0f, max_v, 0.0f, 0.0f
+	};
+
+	gl.BindBuffer(GL_ARRAY_BUFFER, crt_royale_vbo_uv);
+	gl.BufferData(GL_ARRAY_BUFFER, sizeof(uvs), uvs, GL_STATIC_DRAW);
+	gl.VertexAttribPointer(CRT_ROYALE_ATTR_TEX, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), NULL);
+}
+
+static void CrtRoyale_CalcViewport(int *vp_x, int *vp_y, int *vp_w, int *vp_h)
+{
+	float sx = 1.0f;
+	float sy = 1.0f;
+	float vw = VIDEOMODE_custom_horizontal_area;
+	float vh = VIDEOMODE_custom_vertical_area;
+	float a = (float)screen_width / (float)screen_height;
+	float a0 = currently_rotated ? vh / vw : vw / vh;
+
+	if (a > a0)
+		sx = a0 / a;
+	else
+		sy = a / a0;
+
+	if (VIDEOMODE_GetKeepAspect() == VIDEOMODE_KEEP_ASPECT_REAL) {
+		float ar = VIDEOMODE_GetPixelAspectRatio(VIDEOMODE_MODE_NORMAL);
+		if (ar > 1.0f)
+			sy /= ar;
+		else
+			sx *= ar;
+	}
+
+	*vp_w = (int)(screen_width * sx * zoom_factor + 0.5f);
+	*vp_h = (int)(screen_height * sy * zoom_factor + 0.5f);
+	if (*vp_w < 1)
+		*vp_w = 1;
+	if (*vp_h < 1)
+		*vp_h = 1;
+
+	*vp_x = (screen_width - *vp_w) / 2;
+	*vp_y = (screen_height - *vp_h) / 2;
+	if (*vp_x < 0)
+		*vp_x = 0;
+	if (*vp_y < 0)
+		*vp_y = 0;
+}
+
+static void CrtRoyale_CalcPassSizes(int input_w, int input_h, int viewport_w, int viewport_h)
+{
+	int mask_h = (int)(viewport_h * 0.0625f + 0.5f);
+	int mask_w = (int)(viewport_w * 0.0625f + 0.5f);
+
+	if (mask_h < 1)
+		mask_h = 1;
+	if (mask_w < 1)
+		mask_w = 1;
+
+	crt_royale_pass_w[0] = input_w;
+	crt_royale_pass_h[0] = input_h;
+	crt_royale_pass_w[1] = input_w;
+	crt_royale_pass_h[1] = viewport_h;
+	crt_royale_pass_w[2] = 400;
+	crt_royale_pass_h[2] = 300;
+	crt_royale_pass_w[3] = crt_royale_pass_w[2];
+	crt_royale_pass_h[3] = crt_royale_pass_h[2];
+	crt_royale_pass_w[4] = crt_royale_pass_w[2];
+	crt_royale_pass_h[4] = crt_royale_pass_h[2];
+	crt_royale_pass_w[5] = 64;
+	crt_royale_pass_h[5] = mask_h;
+	crt_royale_pass_w[6] = mask_w;
+	crt_royale_pass_h[6] = mask_h;
+	crt_royale_pass_w[7] = viewport_w;
+	crt_royale_pass_h[7] = viewport_h;
+	crt_royale_pass_w[8] = viewport_w;
+	crt_royale_pass_h[8] = viewport_h;
+}
+
+static void CrtRoyale_SetOutputTextureParams(int pass)
+{
+	GLint min_filter = GL_LINEAR;
+	GLint mag_filter = GL_LINEAR;
+
+	if (pass == 5) {
+		min_filter = GL_NEAREST;
+		mag_filter = GL_NEAREST;
+	}
+	if (pass == 7 && crt_royale_use_mipmaps)
+		min_filter = GL_LINEAR_MIPMAP_LINEAR;
+
+	gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_filter);
+	gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag_filter);
+	gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+
+static int CrtRoyale_EnsureTargets(void)
+{
+	int i;
+
+	if (!crt_royale_textures[0])
+		gl.GenTextures(CRT_ROYALE_PASS_COUNT - 1, crt_royale_textures);
+	if (!crt_royale_fbos[0])
+		gl.GenFramebuffers(CRT_ROYALE_PASS_COUNT - 1, crt_royale_fbos);
+
+	for (i = 0; i < CRT_ROYALE_PASS_COUNT - 1; i++) {
+		gl.BindTexture(GL_TEXTURE_2D, crt_royale_textures[i]);
+		CrtRoyale_SetOutputTextureParams(i);
+		gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, crt_royale_pass_w[i], crt_royale_pass_h[i], 0,
+		              GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		gl.BindFramebuffer(GL_FRAMEBUFFER, crt_royale_fbos[i]);
+		gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, crt_royale_textures[i], 0);
+		if (gl.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+			Log_print("CRT-Royale framebuffer incomplete on pass %d", i);
+			gl.BindFramebuffer(GL_FRAMEBUFFER, 0);
+			return FALSE;
+		}
+	}
+	gl.BindFramebuffer(GL_FRAMEBUFFER, 0);
+	return TRUE;
+}
+
+static void CrtRoyale_BindMaskTextures(void)
+{
+	int i;
+
+	for (i = 0; i < CRT_ROYALE_MASK_TEXTURES; i++) {
+		gl.ActiveTexture(GL_TEXTURE0 + CRT_ROYALE_TEXUNIT_MASK_BASE + i);
+		gl.BindTexture(GL_TEXTURE_2D, crt_royale_mask_textures[i]);
+	}
+	gl.ActiveTexture(GL_TEXTURE0);
+}
+
+static void CrtRoyale_BindPassTextures(int pass_index, GLuint input_texture)
+{
+	int i;
+
+	gl.ActiveTexture(GL_TEXTURE0 + CRT_ROYALE_TEXUNIT_TEXTURE);
+	gl.BindTexture(GL_TEXTURE_2D, input_texture);
+
+	for (i = 0; i < CRT_ROYALE_MAX_PASS_PREV; i++) {
+		int prev = pass_index - (i + 1);
+		GLuint tex = 0;
+		if (prev >= 0)
+			tex = crt_royale_textures[prev];
+		gl.ActiveTexture(GL_TEXTURE0 + CRT_ROYALE_TEXUNIT_PASS_PREV_BASE + i);
+		gl.BindTexture(GL_TEXTURE_2D, tex);
+	}
+	gl.ActiveTexture(GL_TEXTURE0);
+}
+
+static void CrtRoyale_SetPassUniforms(int pass_index, int input_w, int input_h,
+                                      int texture_w, int texture_h, int output_w, int output_h,
+                                      const float mvp[4][4])
+{
+	int i;
+	CrtRoyaleUniforms *uniforms = &crt_royale_uniforms[pass_index];
+
+	if (uniforms->mvp >= 0)
+		gl.UniformMatrix4fv(uniforms->mvp, 1, GL_FALSE, &mvp[0][0]);
+	if (uniforms->frame_count >= 0)
+		gl.Uniform1i(uniforms->frame_count, crt_royale_frame_count);
+	if (uniforms->frame_direction >= 0)
+		gl.Uniform1i(uniforms->frame_direction, 1);
+	if (uniforms->input_size >= 0)
+		gl.Uniform2f(uniforms->input_size, (float)input_w, (float)input_h);
+	if (uniforms->texture_size >= 0)
+		gl.Uniform2f(uniforms->texture_size, (float)texture_w, (float)texture_h);
+	if (uniforms->output_size >= 0)
+		gl.Uniform2f(uniforms->output_size, (float)output_w, (float)output_h);
+
+	for (i = 0; i < CRT_ROYALE_MAX_PASS_PREV; i++) {
+		int prev = pass_index - (i + 1);
+		if (prev < 0)
+			continue;
+		if (uniforms->pass_prev_input_size[i] >= 0)
+			gl.Uniform2f(uniforms->pass_prev_input_size[i],
+			             (float)crt_royale_pass_w[prev], (float)crt_royale_pass_h[prev]);
+		if (uniforms->pass_prev_texture_size[i] >= 0)
+			gl.Uniform2f(uniforms->pass_prev_texture_size[i],
+			             (float)crt_royale_pass_w[prev], (float)crt_royale_pass_h[prev]);
+	}
+}
+
+static int CrtRoyale_Init(void)
+{
+	static const GLfloat vertices[] = {
+		-1.0f, -1.0f, 0.0f, 1.0f,
+		+1.0f, -1.0f, 0.0f, 1.0f,
+		+1.0f, +1.0f, 0.0f, 1.0f,
+		-1.0f, +1.0f, 0.0f, 1.0f
+	};
+	static const GLfloat colors[] = {
+		1.0f, 1.0f, 1.0f, 1.0f,
+		1.0f, 1.0f, 1.0f, 1.0f,
+		1.0f, 1.0f, 1.0f, 1.0f,
+		1.0f, 1.0f, 1.0f, 1.0f
+	};
+	int i;
+
+	if (crt_royale_ready)
+		return TRUE;
+	if (!CrtRoyale_LoadFunctions())
+		return FALSE;
+	crt_royale_glsl_version = CrtRoyale_DetectGlslVersion();
+
+	gl.GenVertexArrays(1, &crt_royale_vao);
+	gl.BindVertexArray(crt_royale_vao);
+	gl.GenBuffers(1, &crt_royale_vbo_pos);
+	gl.BindBuffer(GL_ARRAY_BUFFER, crt_royale_vbo_pos);
+	gl.BufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+	gl.VertexAttribPointer(CRT_ROYALE_ATTR_POS, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), NULL);
+	gl.EnableVertexAttribArray(CRT_ROYALE_ATTR_POS);
+
+	gl.GenBuffers(1, &crt_royale_vbo_uv);
+	CrtRoyale_SetUVs(1.0f, 1.0f);
+	gl.EnableVertexAttribArray(CRT_ROYALE_ATTR_TEX);
+
+	gl.GenBuffers(1, &crt_royale_vbo_color);
+	gl.BindBuffer(GL_ARRAY_BUFFER, crt_royale_vbo_color);
+	gl.BufferData(GL_ARRAY_BUFFER, sizeof(colors), colors, GL_STATIC_DRAW);
+	gl.VertexAttribPointer(CRT_ROYALE_ATTR_COLOR, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), NULL);
+	gl.EnableVertexAttribArray(CRT_ROYALE_ATTR_COLOR);
+
+	gl.GenBuffers(1, &crt_royale_ebo);
+	gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, crt_royale_ebo);
+	gl.BufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+	gl.BindVertexArray(0);
+
+	memset(crt_royale_programs, 0, sizeof(crt_royale_programs));
+	for (i = 0; i < CRT_ROYALE_PASS_COUNT; i++) {
+		crt_royale_programs[i] = CrtRoyale_CreateProgram(crt_royale_shader_paths[i], &crt_royale_uniforms[i]);
+		if (!crt_royale_programs[i]) {
+			CrtRoyale_Destroy();
+			return FALSE;
+		}
+	}
+
+	gl.GenTextures(CRT_ROYALE_MASK_TEXTURES, crt_royale_mask_textures);
+	for (i = 0; i < CRT_ROYALE_MASK_TEXTURES; i++) {
+		const CRT_RoyaleMask *mask = &CRT_ROYALE_masks[i];
+		int is_large = mask->width >= 256;
+		gl.BindTexture(GL_TEXTURE_2D, crt_royale_mask_textures[i]);
+		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		if (is_large && gl.GenerateMipmap)
+			gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+		else
+			gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, mask->width, mask->height, 0,
+		              GL_RGB, GL_UNSIGNED_BYTE, mask->data);
+		if (is_large && gl.GenerateMipmap)
+			gl.GenerateMipmap(GL_TEXTURE_2D);
+	}
+
+	crt_royale_use_mipmaps = gl.GenerateMipmap != NULL;
+	crt_royale_ready = TRUE;
+	crt_royale_failed = FALSE;
+	return TRUE;
+}
+
+static int CrtRoyale_Display(void)
+{
+	int input_w;
+	int input_h;
+	int vp_x;
+	int vp_y;
+	int vp_w;
+	int vp_h;
+	float proj[4][4];
+	int pass;
+
+	if (crt_royale_failed)
+		return FALSE;
+	if (!CrtRoyale_Init()) {
+		crt_royale_failed = TRUE;
+		return FALSE;
+	}
+
+	input_w = (int)VIDEOMODE_custom_horizontal_area;
+	input_h = (int)VIDEOMODE_custom_vertical_area;
+	if (input_w <= 0 || input_h <= 0)
+		return FALSE;
+
+	CrtRoyale_CalcViewport(&vp_x, &vp_y, &vp_w, &vp_h);
+	if (input_w != crt_royale_input_w || input_h != crt_royale_input_h ||
+	    vp_w != crt_royale_viewport_w || vp_h != crt_royale_viewport_h) {
+		crt_royale_input_w = input_w;
+		crt_royale_input_h = input_h;
+		crt_royale_viewport_w = vp_w;
+		crt_royale_viewport_h = vp_h;
+		CrtRoyale_CalcPassSizes(input_w, input_h, vp_w, vp_h);
+		if (!CrtRoyale_EnsureTargets()) {
+			crt_royale_failed = TRUE;
+			return FALSE;
+		}
+	}
+
+	gl.BindFramebuffer(GL_FRAMEBUFFER, 0);
+	gl.Viewport(0, 0, screen_width, screen_height);
+	gl.Clear(GL_COLOR_BUFFER_BIT);
+
+	gl.BindTexture(GL_TEXTURE_2D, textures[0]);
+	(*blit_funcs[SDL_VIDEO_current_display_mode])(screen_texture);
+	gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, VIDEOMODE_actual_width, VIDEOMODE_src_height,
+	                 pixel_formats[SDL_VIDEO_GL_pixel_format].format,
+	                 pixel_formats[SDL_VIDEO_GL_pixel_format].type,
+	                 screen_texture);
+
+	gl.Disable(GL_BLEND);
+	gl.BindVertexArray(crt_royale_vao);
+
+	CrtRoyale_SetUVs((float)VIDEOMODE_custom_horizontal_area / TEX_WIDTH,
+	                 (float)VIDEOMODE_custom_vertical_area / TEX_HEIGHT);
+
+	for (pass = 0; pass < CRT_ROYALE_PASS_COUNT - 1; pass++) {
+		GLuint input_texture = (pass == 0) ? textures[0] : crt_royale_textures[pass - 1];
+		int pass_input_w = (pass == 0) ? input_w : crt_royale_pass_w[pass - 1];
+		int pass_input_h = (pass == 0) ? input_h : crt_royale_pass_h[pass - 1];
+		int pass_tex_w = (pass == 0) ? TEX_WIDTH : pass_input_w;
+		int pass_tex_h = (pass == 0) ? TEX_HEIGHT : pass_input_h;
+
+		if (pass == 1)
+			CrtRoyale_SetUVs(1.0f, 1.0f);
+
+		SetOrtho(proj, 1.0f, -1.0f, 0.0f);
+		gl.UseProgram(crt_royale_programs[pass]);
+		CrtRoyale_SetPassUniforms(pass, pass_input_w, pass_input_h,
+		                          pass_tex_w, pass_tex_h,
+		                          crt_royale_pass_w[pass], crt_royale_pass_h[pass], proj);
+		CrtRoyale_BindPassTextures(pass, input_texture);
+		CrtRoyale_BindMaskTextures();
+
+		gl.BindFramebuffer(GL_FRAMEBUFFER, crt_royale_fbos[pass]);
+		gl.Viewport(0, 0, crt_royale_pass_w[pass], crt_royale_pass_h[pass]);
+		gl.DrawElements(GL_TRIANGLES, kIndexCount, GL_UNSIGNED_SHORT, 0);
+
+		if (pass == 7 && crt_royale_use_mipmaps) {
+			gl.BindTexture(GL_TEXTURE_2D, crt_royale_textures[7]);
+			gl.GenerateMipmap(GL_TEXTURE_2D);
+		}
+	}
+
+	SetOrtho(proj, 1.0f, 1.0f, currently_rotated ? 90.0f : 0.0f);
+	gl.UseProgram(crt_royale_programs[CRT_ROYALE_PASS_COUNT - 1]);
+	CrtRoyale_SetPassUniforms(CRT_ROYALE_PASS_COUNT - 1,
+	                          crt_royale_pass_w[CRT_ROYALE_PASS_COUNT - 2],
+	                          crt_royale_pass_h[CRT_ROYALE_PASS_COUNT - 2],
+	                          crt_royale_pass_w[CRT_ROYALE_PASS_COUNT - 2],
+	                          crt_royale_pass_h[CRT_ROYALE_PASS_COUNT - 2],
+	                          crt_royale_pass_w[CRT_ROYALE_PASS_COUNT - 1],
+	                          crt_royale_pass_h[CRT_ROYALE_PASS_COUNT - 1], proj);
+	CrtRoyale_BindPassTextures(CRT_ROYALE_PASS_COUNT - 1, crt_royale_textures[CRT_ROYALE_PASS_COUNT - 2]);
+	CrtRoyale_BindMaskTextures();
+
+	gl.BindFramebuffer(GL_FRAMEBUFFER, 0);
+	gl.Viewport(vp_x, vp_y, vp_w, vp_h);
+	gl.DrawElements(GL_TRIANGLES, kIndexCount, GL_UNSIGNED_SHORT, 0);
+
+	SDL_GL_SwapWindow(SDL_VIDEO_wnd);
+	gl.Viewport(0, 0, screen_width, screen_height);
+	gl.BindVertexArray(0);
+	crt_royale_frame_count++;
+	return TRUE;
+}
 
 #endif /* SDL2 */
 
@@ -1016,6 +1774,9 @@ int SDL_VIDEO_GL_SetVideoMode(VIDEOMODE_resolution_t const *res, int windowed, V
 			blit_funcs[0] = &DisplayPalBlending;
 		else
 #endif /* PAL_BLENDING */
+		if (ARTIFACT_mode == ARTIFACT_PAL_ALTIRRA_HI)
+			blit_funcs[0] = &DisplayAltirraPalHi;
+		else
 			blit_funcs[0] = &DisplayNormal;
 	}
 
@@ -1034,6 +1795,221 @@ int SDL_VIDEO_GL_SupportsVideomode(VIDEOMODE_MODE_t mode, int stretch, int rotat
 {
 	/* OpenGL supports rotation and stretching in all display modes. */
 	return TRUE;
+}
+
+static void BuildChannelMap(Uint32 mask, Uint32 *map)
+{
+	int shift = 0;
+	unsigned int bits = 0;
+	Uint32 work = mask;
+	Uint32 max;
+	int i;
+
+	if (work == 0) {
+		memset(map, 0, sizeof(Uint32) * 256);
+		return;
+	}
+
+	while ((work & 1) == 0) {
+		shift++;
+		work >>= 1;
+	}
+	while (work & 1) {
+		bits++;
+		work >>= 1;
+	}
+	max = (bits == 0) ? 0 : ((1u << bits) - 1u);
+	for (i = 0; i < 256; i++)
+		map[i] = (bits == 0) ? 0 : ((Uint32)((i * max + 127) / 255) << shift);
+}
+
+static void AltirraPalHi_UpdatePixelMaps(void)
+{
+	int format = SDL_VIDEO_GL_pixel_format;
+
+	if (format == pal_hi_pixel_format)
+		return;
+
+	pal_hi_pixel_format = format;
+	BuildChannelMap(pixel_formats[format].rmask, pal_hi_map_r);
+	BuildChannelMap(pixel_formats[format].gmask, pal_hi_map_g);
+	BuildChannelMap(pixel_formats[format].bmask, pal_hi_map_b);
+}
+
+static int AltirraPalHi_Init(void)
+{
+	if (pal_hi_engine == NULL) {
+		ATC_ColorParams color_params;
+		ATC_ArtifactingParams artifact_params;
+		pal_hi_engine = atc_artifacting_create();
+		if (pal_hi_engine == NULL)
+			return FALSE;
+		atc_color_params_default_pal(&color_params);
+		// Native Altirra defaults would be the following:
+		// color_params.mArtifactSat = 0.80f;
+		// color_params.mArtifactSharpness = 0.50f;
+		// color_params.mSaturation = 0.29f;
+		// color_params.mContrast = 1.0f;
+		// color_params.mArtifactHue = 80.f;
+		/* Soften PAL hi artifacting to better match Altirra's default look. */
+		color_params.mArtifactSat = 0.80f;
+		color_params.mArtifactSharpness = 0.50f;
+		color_params.mSaturation = 0.29f;
+		color_params.mContrast = 1.0f;
+		color_params.mArtifactHue = 260.f;
+		color_params.mHueStart = -12.0f;
+		color_params.mHueRange = 18.3f * 15.0f;
+		atc_artifacting_params_default(&artifact_params);
+		atc_artifacting_set_color_params(pal_hi_engine, &color_params, NULL, NULL, ATC_MONITOR_COLOR, 0);
+		atc_artifacting_set_artifacting_params(pal_hi_engine, &artifact_params);
+	}
+
+	if (pal_hi_input == NULL) {
+		pal_hi_input = (Uint8 *) Util_malloc(ATC_ARTIFACTING_N * ATC_ARTIFACTING_M);
+		if (pal_hi_input == NULL)
+			return FALSE;
+	}
+
+	if (pal_hi_output == NULL) {
+		pal_hi_output = (Uint32 *) Util_malloc(sizeof(Uint32) * ATC_ARTIFACTING_N * 2 * ATC_ARTIFACTING_M);
+		if (pal_hi_output == NULL)
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+static void AltirraPalHi_BlitScaled16(Uint16 *dest, int dest_pitch, const Uint32 *src, int src_pitch,
+                                      int src_w, int src_h, int out_w, int out_h)
+{
+	int y = 0;
+	if (src_w <= 0 || src_h <= 0 || out_w <= 0 || out_h <= 0)
+		return;
+	int w = src_w << 16;
+	int h = src_h << 16;
+	int dx = w / out_w;
+	int dy = h / out_h;
+	int i;
+
+	for (i = 0; i < out_h; i++) {
+		int x = 0;
+		const Uint32 *src_line = src + (y >> 16) * src_pitch;
+		int pos;
+		for (pos = 0; pos < out_w; pos++) {
+			Uint32 c = src_line[x >> 16];
+			Uint8 b = (Uint8)(c & 0xff);
+			Uint8 g = (Uint8)((c >> 8) & 0xff);
+			Uint8 r = (Uint8)((c >> 16) & 0xff);
+			dest[pos] = (Uint16)(pal_hi_map_r[r] | pal_hi_map_g[g] | pal_hi_map_b[b]);
+			x += dx;
+		}
+		dest += dest_pitch;
+		y += dy;
+	}
+}
+
+static void AltirraPalHi_BlitScaled32(Uint32 *dest, int dest_pitch, const Uint32 *src, int src_pitch,
+                                      int src_w, int src_h, int out_w, int out_h)
+{
+	int y = 0;
+	if (src_w <= 0 || src_h <= 0 || out_w <= 0 || out_h <= 0)
+		return;
+	int w = src_w << 16;
+	int h = src_h << 16;
+	int dx = w / out_w;
+	int dy = h / out_h;
+	int i;
+
+	for (i = 0; i < out_h; i++) {
+		int x = 0;
+		const Uint32 *src_line = src + (y >> 16) * src_pitch;
+		int pos;
+		for (pos = 0; pos < out_w; pos++) {
+			Uint32 c = src_line[x >> 16];
+			Uint8 b = (Uint8)(c & 0xff);
+			Uint8 g = (Uint8)((c >> 8) & 0xff);
+			Uint8 r = (Uint8)((c >> 16) & 0xff);
+			dest[pos] = pal_hi_map_r[r] | pal_hi_map_g[g] | pal_hi_map_b[b];
+			x += dx;
+		}
+		dest += dest_pitch;
+		y += dy;
+	}
+}
+
+static void DisplayAltirraPalHi(GLvoid *dest)
+{
+	int copy_w;
+	int copy_h;
+	int pad_x;
+	int pad_y;
+	int output_stride;
+	int region_w;
+	int region_h;
+	Uint8 *src;
+	Uint8 *dst;
+	int y;
+
+	if (!AltirraPalHi_Init()) {
+		DisplayNormal(dest);
+		return;
+	}
+
+	AltirraPalHi_UpdatePixelMaps();
+
+	copy_w = (int)VIDEOMODE_src_width;
+	copy_h = (int)VIDEOMODE_src_height;
+	if (copy_w > ATC_ARTIFACTING_N)
+		copy_w = ATC_ARTIFACTING_N;
+	if (copy_h > ATC_ARTIFACTING_M)
+		copy_h = ATC_ARTIFACTING_M;
+
+	pad_x = (ATC_ARTIFACTING_N - copy_w) / 2;
+	pad_y = (ATC_ARTIFACTING_M - copy_h) / 2;
+	memset(pal_hi_input, GTIA_COLBK, ATC_ARTIFACTING_N * ATC_ARTIFACTING_M);
+	memset(pal_hi_scanline_hires, 0, sizeof(pal_hi_scanline_hires));
+	src = (Uint8 *)Screen_atari + Screen_WIDTH * VIDEOMODE_src_offset_top + VIDEOMODE_src_offset_left;
+	dst = pal_hi_input + pad_y * ATC_ARTIFACTING_N + pad_x;
+	for (y = 0; y < copy_h; y++) {
+		int line = VIDEOMODE_src_offset_top + y;
+		int hires = 0;
+		if (line >= 0 && line < Screen_HEIGHT)
+			hires = ANTIC_scanline_hires[line] != 0;
+		memcpy(dst, src, copy_w);
+		pal_hi_scanline_hires[pad_y + y] = (Uint8)hires;
+		src += Screen_WIDTH;
+		dst += ATC_ARTIFACTING_N;
+	}
+
+	atc_artifacting_begin_frame(pal_hi_engine, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+	output_stride = ATC_ARTIFACTING_N * 2;
+	for (y = 0; y < ATC_ARTIFACTING_M; y++) {
+		int scanline_hires = pal_hi_scanline_hires[y] != 0;
+		atc_artifacting_artifact8(pal_hi_engine, (uint32_t)y,
+		                          pal_hi_output + y * output_stride,
+		                          pal_hi_input + y * ATC_ARTIFACTING_N,
+		                          scanline_hires, 0, 1);
+	}
+
+	region_w = copy_w * 2;
+	region_h = copy_h;
+	if (region_w <= 0 || region_h <= 0)
+		return;
+	if (VIDEOMODE_actual_width == 0 || VIDEOMODE_src_height == 0)
+		return;
+
+	if (bpp_32) {
+		AltirraPalHi_BlitScaled32((Uint32 *)dest, VIDEOMODE_actual_width,
+		                          pal_hi_output + pad_y * output_stride + pad_x * 2,
+		                          output_stride, region_w, region_h,
+		                          VIDEOMODE_actual_width, VIDEOMODE_src_height);
+	}
+	else {
+		AltirraPalHi_BlitScaled16((Uint16 *)dest, VIDEOMODE_actual_width,
+		                          pal_hi_output + pad_y * output_stride + pad_x * 2,
+		                          output_stride, region_w, region_h,
+		                          VIDEOMODE_actual_width, VIDEOMODE_src_height);
+	}
 }
 
 static void DisplayNormal(GLvoid *dest)
@@ -1154,15 +2130,13 @@ static void DisplayBIT3(GLvoid *dest)
 }
 #endif
 
-
-void SDL_VIDEO_GL_DisplayScreen(void)
-{
 #if SDL2
-	if (!screen_width || !screen_height) return;
-
+static void SDL_VIDEO_GL_DisplayScreenStandard(void)
+{
 	gl.Clear(GL_COLOR_BUFFER_BIT);
 	gl.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 	gl.Enable(GL_BLEND);
+	gl.UseProgram(progID);
 	gl.Uniform1i(our_texture, 0);
 	gl.ActiveTexture(GL_TEXTURE0);
 	gl.BindTexture(GL_TEXTURE_2D, textures[0]);
@@ -1208,14 +2182,26 @@ void SDL_VIDEO_GL_DisplayScreen(void)
 	gl.Uniform1f(sh_pixelSpread, SDL_VIDEO_crt_beam_shape ? pow((27.0f - SDL_VIDEO_crt_beam_shape) / 20.0f, 2) : 0.0f);
 	gl.Uniform1f(sh_glow, SDL_VIDEO_crt_phosphor_glow / 20.0f);
 
-	gl.UseProgram(progID);
-
 	gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, buffers[2]);
 	gl.DrawElements(GL_TRIANGLES, kIndexCount, GL_UNSIGNED_SHORT, 0);
 	SDL_GL_SwapWindow(SDL_VIDEO_wnd);
 
 	gl.BindBuffer(GL_ARRAY_BUFFER, 0);
 	gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+}
+#endif
+
+
+void SDL_VIDEO_GL_DisplayScreen(void)
+{
+#if SDL2
+	if (!screen_width || !screen_height) return;
+
+	if (SDL_VIDEO_crt_emulation == SDL_VIDEO_CRT_EMULATION_ROYALE) {
+		if (CrtRoyale_Display())
+			return;
+	}
+	SDL_VIDEO_GL_DisplayScreenStandard();
 
 #else
 	gl.BindTexture(GL_TEXTURE_2D, textures[0]);

@@ -31,12 +31,15 @@
 #include <SDL_video.h>
 #endif
 #include "af80.h"
+#include "antic.h"
 #include "bit3.h"
 #include "artifact.h"
+#include "altirra_artifacting/artifacting_c.h"
 #include "atari.h"
 #include "colours.h"
 #include "config.h"
 #include "filter_ntsc.h"
+#include "gtia.h"
 #include "log.h"
 #include "pbi_proto80.h"
 #ifdef PAL_BLENDING
@@ -57,9 +60,22 @@ static int fullscreen = 1;
 
 int SDL_VIDEO_SW_bpp = 0;
 
+static ATC_ArtifactingEngine *pal_hi_engine = NULL;
+static Uint8 *pal_hi_input = NULL;
+static Uint32 *pal_hi_output = NULL;
+static Uint32 pal_hi_map_r[256];
+static Uint32 pal_hi_map_g[256];
+static Uint32 pal_hi_map_b[256];
+static Uint32 pal_hi_rmask = 0;
+static Uint32 pal_hi_gmask = 0;
+static Uint32 pal_hi_bmask = 0;
+static int pal_hi_bpp = 0;
+static Uint8 pal_hi_scanline_hires[ATC_ARTIFACTING_M];
+
 static void DisplayWithoutScaling(void);
 static void DisplayWithScaling(void);
 static void DisplayRotated(void);
+static void DisplayAltirraPalHi(void);
 #ifdef NTSC_FILTER
 static void DisplayNTSCEmu(void);
 #endif
@@ -295,8 +311,9 @@ void SDL_VIDEO_SW_SetVideoMode(VIDEOMODE_resolution_t const *res, int windowed, 
 #ifdef PAL_BLENDING
 		  || (mode == VIDEOMODE_MODE_NORMAL && ARTIFACT_mode == ARTIFACT_PAL_BLEND)
 #endif /* PAL_BLENDING */
+		  || (mode == VIDEOMODE_MODE_NORMAL && ARTIFACT_mode == ARTIFACT_PAL_ALTIRRA_HI)
 		 ) && SDL_VIDEO_SW_bpp != 16 && SDL_VIDEO_SW_bpp != 32)) {
-		/* Rotate90 supports only 16bpp; NTSC filter and PAL blending don't support 8bpp. */
+		/* Rotate90 supports only 16bpp; NTSC filter and PAL modes don't support 8bpp. */
 		SDL_VIDEO_SW_bpp = 16;
 	}
 
@@ -321,6 +338,8 @@ void SDL_VIDEO_SW_SetVideoMode(VIDEOMODE_resolution_t const *res, int windowed, 
 	if (mode == VIDEOMODE_MODE_NORMAL) {
 		if (rotate90)
 			blit_funcs[0] = &DisplayRotated;
+		else if (ARTIFACT_mode == ARTIFACT_PAL_ALTIRRA_HI)
+			blit_funcs[0] = &DisplayAltirraPalHi;
 #ifdef PAL_BLENDING
 		else if (ARTIFACT_mode == ARTIFACT_PAL_BLEND) {
 			if (VIDEOMODE_src_width == VIDEOMODE_dest_width && VIDEOMODE_src_height == VIDEOMODE_dest_height)
@@ -872,6 +891,247 @@ static void DisplayWithScaling(void)
 			y += dy;
 			i--;
 		}
+	}
+}
+
+static void BuildChannelMap(Uint32 mask, Uint32 *map)
+{
+	unsigned int shift = 0;
+	unsigned int bits = 0;
+	Uint32 work = mask;
+	Uint32 max;
+	int i;
+
+	if (work == 0) {
+		memset(map, 0, sizeof(Uint32) * 256);
+		return;
+	}
+
+	while ((work & 1) == 0) {
+		shift++;
+		work >>= 1;
+	}
+	while (work & 1) {
+		bits++;
+		work >>= 1;
+	}
+	max = (bits == 0) ? 0 : ((1u << bits) - 1u);
+	for (i = 0; i < 256; i++)
+		map[i] = (bits == 0) ? 0 : ((Uint32)((i * max + 127) / 255) << shift);
+}
+
+static void AltirraPalHi_UpdatePixelMaps(void)
+{
+	Uint32 rmask;
+	Uint32 gmask;
+	Uint32 bmask;
+	int bpp;
+
+	if (SDL_VIDEO_screen == NULL || SDL_VIDEO_screen->format == NULL)
+		return;
+
+	bpp = SDL_VIDEO_screen->format->BitsPerPixel;
+	if (bpp != 16 && bpp != 32)
+		return;
+
+	rmask = SDL_VIDEO_screen->format->Rmask;
+	gmask = SDL_VIDEO_screen->format->Gmask;
+	bmask = SDL_VIDEO_screen->format->Bmask;
+	if (bpp == pal_hi_bpp && rmask == pal_hi_rmask && gmask == pal_hi_gmask && bmask == pal_hi_bmask)
+		return;
+
+	pal_hi_bpp = bpp;
+	pal_hi_rmask = rmask;
+	pal_hi_gmask = gmask;
+	pal_hi_bmask = bmask;
+	BuildChannelMap(rmask, pal_hi_map_r);
+	BuildChannelMap(gmask, pal_hi_map_g);
+	BuildChannelMap(bmask, pal_hi_map_b);
+}
+
+static int AltirraPalHi_Init(void)
+{
+	if (pal_hi_engine == NULL) {
+		ATC_ColorParams color_params;
+		ATC_ArtifactingParams artifact_params;
+		pal_hi_engine = atc_artifacting_create();
+		if (pal_hi_engine == NULL)
+			return FALSE;
+		atc_color_params_default_pal(&color_params);
+		// Native Altirra defaults would be the following:
+		// color_params.mArtifactSat = 0.80f;
+		// color_params.mArtifactSharpness = 0.50f;
+		// color_params.mSaturation = 0.29f;
+		// color_params.mContrast = 1.0f;
+		// color_params.mArtifactHue = 80.f;
+		/* Soften PAL hi artifacting to better match Altirra's default look. */
+		color_params.mArtifactSat = 0.80f;
+		color_params.mArtifactSharpness = 0.50f;
+		color_params.mSaturation = 0.29f;
+		color_params.mContrast = 1.0f;
+		color_params.mArtifactHue = 260.f;
+		color_params.mHueStart = -12.0f;
+		color_params.mHueRange = 18.3f * 15.0f;
+		atc_artifacting_params_default(&artifact_params);
+		atc_artifacting_set_color_params(pal_hi_engine, &color_params, NULL, NULL, ATC_MONITOR_COLOR, 0);
+		atc_artifacting_set_artifacting_params(pal_hi_engine, &artifact_params);
+	}
+
+	if (pal_hi_input == NULL) {
+		pal_hi_input = (Uint8 *) Util_malloc(ATC_ARTIFACTING_N * ATC_ARTIFACTING_M);
+		if (pal_hi_input == NULL)
+			return FALSE;
+	}
+
+	if (pal_hi_output == NULL) {
+		pal_hi_output = (Uint32 *) Util_malloc(sizeof(Uint32) * ATC_ARTIFACTING_N * 2 * ATC_ARTIFACTING_M);
+		if (pal_hi_output == NULL)
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+static void AltirraPalHi_BlitScaled16(Uint16 *dest, int dest_pitch, const Uint32 *src, int src_pitch,
+                                      int src_w, int src_h, int out_w, int out_h)
+{
+	int y = 0;
+	if (src_w <= 0 || src_h <= 0 || out_w <= 0 || out_h <= 0)
+		return;
+	int w = src_w << 16;
+	int h = src_h << 16;
+	int dx = w / out_w;
+	int dy = h / out_h;
+	int i;
+
+	for (i = 0; i < out_h; i++) {
+		int x = 0;
+		const Uint32 *src_line = src + (y >> 16) * src_pitch;
+		int pos;
+		for (pos = 0; pos < out_w; pos++) {
+			Uint32 c = src_line[x >> 16];
+			Uint8 b = (Uint8)(c & 0xff);
+			Uint8 g = (Uint8)((c >> 8) & 0xff);
+			Uint8 r = (Uint8)((c >> 16) & 0xff);
+			dest[pos] = (Uint16)(pal_hi_map_r[r] | pal_hi_map_g[g] | pal_hi_map_b[b]);
+			x += dx;
+		}
+		dest += dest_pitch;
+		y += dy;
+	}
+}
+
+static void AltirraPalHi_BlitScaled32(Uint32 *dest, int dest_pitch, const Uint32 *src, int src_pitch,
+                                      int src_w, int src_h, int out_w, int out_h)
+{
+	int y = 0;
+	if (src_w <= 0 || src_h <= 0 || out_w <= 0 || out_h <= 0)
+		return;
+	int w = src_w << 16;
+	int h = src_h << 16;
+	int dx = w / out_w;
+	int dy = h / out_h;
+	int i;
+
+	for (i = 0; i < out_h; i++) {
+		int x = 0;
+		const Uint32 *src_line = src + (y >> 16) * src_pitch;
+		int pos;
+		for (pos = 0; pos < out_w; pos++) {
+			Uint32 c = src_line[x >> 16];
+			Uint8 b = (Uint8)(c & 0xff);
+			Uint8 g = (Uint8)((c >> 8) & 0xff);
+			Uint8 r = (Uint8)((c >> 16) & 0xff);
+			dest[pos] = pal_hi_map_r[r] | pal_hi_map_g[g] | pal_hi_map_b[b];
+			x += dx;
+		}
+		dest += dest_pitch;
+		y += dy;
+	}
+}
+
+static void DisplayAltirraPalHi(void)
+{
+	int copy_w;
+	int copy_h;
+	int pad_x;
+	int pad_y;
+	int output_stride;
+	int region_w;
+	int region_h;
+	Uint8 *src;
+	Uint8 *dst;
+	Uint8 *pixels;
+	int y;
+	int bpp;
+
+	if (!AltirraPalHi_Init()) {
+		DisplayWithScaling();
+		return;
+	}
+
+	bpp = SDL_VIDEO_screen->format->BitsPerPixel;
+	if (bpp != 16 && bpp != 32) {
+		DisplayWithScaling();
+		return;
+	}
+	AltirraPalHi_UpdatePixelMaps();
+
+	copy_w = (int)VIDEOMODE_src_width;
+	copy_h = (int)VIDEOMODE_src_height;
+	if (copy_w > ATC_ARTIFACTING_N)
+		copy_w = ATC_ARTIFACTING_N;
+	if (copy_h > ATC_ARTIFACTING_M)
+		copy_h = ATC_ARTIFACTING_M;
+
+	pad_x = (ATC_ARTIFACTING_N - copy_w) / 2;
+	pad_y = (ATC_ARTIFACTING_M - copy_h) / 2;
+	memset(pal_hi_input, GTIA_COLBK, ATC_ARTIFACTING_N * ATC_ARTIFACTING_M);
+	memset(pal_hi_scanline_hires, 0, sizeof(pal_hi_scanline_hires));
+	src = (Uint8 *)Screen_atari + Screen_WIDTH * VIDEOMODE_src_offset_top + VIDEOMODE_src_offset_left;
+	dst = pal_hi_input + pad_y * ATC_ARTIFACTING_N + pad_x;
+	for (y = 0; y < copy_h; y++) {
+		int line = VIDEOMODE_src_offset_top + y;
+		int hires = 0;
+		if (line >= 0 && line < Screen_HEIGHT)
+			hires = ANTIC_scanline_hires[line] != 0;
+		memcpy(dst, src, copy_w);
+		pal_hi_scanline_hires[pad_y + y] = (Uint8)hires;
+		src += Screen_WIDTH;
+		dst += ATC_ARTIFACTING_N;
+	}
+
+	atc_artifacting_begin_frame(pal_hi_engine, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+	output_stride = ATC_ARTIFACTING_N * 2;
+	for (y = 0; y < ATC_ARTIFACTING_M; y++) {
+		int scanline_hires = pal_hi_scanline_hires[y] != 0;
+		atc_artifacting_artifact8(pal_hi_engine, (uint32_t)y,
+		                          pal_hi_output + y * output_stride,
+		                          pal_hi_input + y * ATC_ARTIFACTING_N,
+		                          scanline_hires, 0, 1);
+	}
+
+	region_w = copy_w * 2;
+	region_h = copy_h;
+	if (region_w <= 0 || region_h <= 0)
+		return;
+	if (VIDEOMODE_dest_width == 0 || VIDEOMODE_dest_height == 0)
+		return;
+
+	pixels = (Uint8 *) SDL_VIDEO_screen->pixels + SDL_VIDEO_screen->pitch * VIDEOMODE_dest_offset_top;
+	if (bpp == 16) {
+		pixels += VIDEOMODE_dest_offset_left * 2;
+		AltirraPalHi_BlitScaled16((Uint16 *)pixels, SDL_VIDEO_screen->pitch / 2,
+		                          pal_hi_output + pad_y * output_stride + pad_x * 2,
+		                          output_stride, region_w, region_h,
+		                          VIDEOMODE_dest_width, VIDEOMODE_dest_height);
+	}
+	else {
+		pixels += VIDEOMODE_dest_offset_left * 4;
+		AltirraPalHi_BlitScaled32((Uint32 *)pixels, SDL_VIDEO_screen->pitch / 4,
+		                          pal_hi_output + pad_y * output_stride + pad_x * 2,
+		                          output_stride, region_w, region_h,
+		                          VIDEOMODE_dest_width, VIDEOMODE_dest_height);
 	}
 }
 

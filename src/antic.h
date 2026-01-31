@@ -2,6 +2,9 @@
 #define ANTIC_H_
 
 #include "atari.h"
+#if !defined(BASIC) && !defined(CURSES_BASIC)
+#include "screen.h"
+#endif
 
 /*
  * Offset to registers in custom relative to start of antic memory addresses.
@@ -32,6 +35,10 @@ extern UBYTE ANTIC_NMIEN;
 extern UBYTE ANTIC_NMIST;
 extern UBYTE ANTIC_PMBASE;
 extern UBYTE ANTIC_VSCROL;
+
+#if !defined(BASIC) && !defined(CURSES_BASIC)
+extern UBYTE ANTIC_scanline_hires[Screen_HEIGHT];
+#endif
 
 extern int ANTIC_break_ypos;
 extern int ANTIC_ypos;

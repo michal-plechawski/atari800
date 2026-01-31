@@ -56,6 +56,13 @@ extern int SDL_VIDEO_crt_beam_shape;
 void SDL_VIDEO_CrtBeamShape(int value);
 extern int SDL_VIDEO_crt_phosphor_glow;
 void SDL_VIDEO_CrtPhosphorGlow(int value);
+typedef enum {
+	SDL_VIDEO_CRT_EMULATION_STANDARD = 0,
+	SDL_VIDEO_CRT_EMULATION_ROYALE,
+	SDL_VIDEO_CRT_EMULATION_SIZE
+} SDL_VIDEO_CrtEmulation_t;
+extern int SDL_VIDEO_crt_emulation;
+void SDL_VIDEO_SetCrtEmulation(int value);
 
 /* Get/set scanlines interplation, both in sowtfare and in OpenGL mode. */
 /* Use SDL_VIDEO_SetInterpolateScanlines() to set this value. */

@@ -210,7 +210,7 @@ Command line options
 -refresh <rate>       Set screen refresh rate
 -ntsc-artif none|ntsc-old|ntsc-new|ntsc-full
                       Set video artifacting emulation mode for NTSC.
--pal-artif none|pal-simple|pal-blend
+-pal-artif none|pal-simple|pal-blend|pal-altirra-hi
                       Set video artifacting emulation mode for PAL.
 
 -artif <mode>         Set artifacting mode 0-4 (0 = disable) - only for
@@ -622,4 +622,3 @@ Alt        Atari/Inverse key (either Alt key will work)
 Joystick 0 is operated by the mouse position relative to the center of the
 screen. The mouse button acts as the trigger. On Linux, standard joysticks
 are also supported.
-
